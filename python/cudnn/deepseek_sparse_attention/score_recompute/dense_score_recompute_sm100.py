@@ -41,6 +41,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
+    PipelineAsync,
     PipelineTmaUmma,
     PipelineUserType,
     make_pipeline_state,
@@ -138,7 +139,11 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         self.reduce_sync_arrive_count = self.WARPGROUP_SIZE
 
         self.num_warps_in_epi_wg = len(self.epilogue_wg_warp_ids)
-        self.sScoreAll_size = self.num_warps_in_epi_wg * 2
+        # Cross-warp denom scratch, double-buffered by the reduce phase: a warp that races ahead to the next
+        # tile writes the other half, so it never overwrites a partial another warp is still reading (a warp
+        # cannot get two tiles ahead without every warp passing the intermediate reduce barrier).
+        self.sScoreAll_phase_size = self.num_warps_in_epi_wg * 2
+        self.sScoreAll_size = 2 * self.sScoreAll_phase_size
 
     # =========================================================================
     # Host-side entry
@@ -369,6 +374,7 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
 
         @cute.struct
         class SharedStorage:
+            per_head_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.Q_mbar_size]
             K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.K_mbar_size]
             S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.S_mbar_size]
@@ -419,6 +425,16 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         )
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
+
+        # Per-head LSE (2 stages): all 32 load lanes publish after their stores; every epilogue lane
+        # releases a slot only after the tile's epilogue has read it.
+        pipeline_head = PipelineAsync.create(
+            barrier_storage=storage.per_head_mbar_ptr.data_ptr(),
+            num_stages=2,
+            producer_group=CooperativeGroup(Agent.Thread, self.WARP_SIZE),
+            consumer_group=CooperativeGroup(Agent.Thread, self.WARPGROUP_SIZE),
+            defer_sync=True,
+        )
 
         # Q pipeline (1 stage)
         pipeline_Q = PipelineTmaUmma.create(
@@ -477,6 +493,7 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         )
         work_tile = tile_sched.initial_work_tile_info()
 
+        head_producer, head_consumer = pipeline_head.make_participants()
         Q_producer, Q_consumer = pipeline_Q.make_participants()
         K_producer, K_consumer = pipeline_K.make_participants()
 
@@ -502,7 +519,6 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
             if warp_idx == self.load_warp_id:
                 rows_per_thread = cute.ceil_div(self.m_block_size, self.WARP_SIZE)
                 lane_id = tidx % self.WARP_SIZE
-                tile_count = Int32(0)
 
                 while work_tile.is_valid_tile:
                     m_block_sched = work_tile.tile_idx[0]
@@ -524,7 +540,8 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
                             q_causal_offset,
                         )
                         # PerHead data load (double-buffered)
-                        per_head_buf_off = (tile_count % 2) * self.m_block_size
+                        head = head_producer.acquire_and_advance()
+                        per_head_buf_off = head.index * self.m_block_size
                         mPerHead_cur = seqlen.offset_batch_Q(mPerHead, batch_idx, dim=2)
                         for ri in cutlass.range_constexpr(rows_per_thread):
                             row = ri * self.WARP_SIZE + lane_id
@@ -537,6 +554,7 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
                                 else:
                                     sPerHead[per_head_buf_off + row] = Float32(0.0)
 
+                        head.commit()
                         cute.arch.fence_view_async_shared()
 
                         # TMA Q load (1 barrier, num_k_chunks TMA copies)
@@ -583,12 +601,12 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
                                 )
                                 load_K_fn(tma_bar_ptr=handle_K.barrier)
                             n_block_k = n_block_k - 1
-                        tile_count = tile_count + 1
 
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
+                head_producer.tail()
                 Q_producer.tail()
                 K_producer.tail()
 
@@ -704,7 +722,6 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
             cute.arch.setmaxregister_increase(self.num_regs_epilogue)
             s_full_phase_bits = Int32(0)
             reduce_phase = Int32(0)
-            tile_count = Int32(0)
             while work_tile.is_valid_tile:
                 m_block_sched = work_tile.tile_idx[0]
                 batch_idx = work_tile.tile_idx[2]
@@ -724,13 +741,22 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
                         seqlen.seqlen_k,
                         q_causal_offset,
                     )
-                    per_head_offset = (tile_count % 2) * self.m_block_size
+                    # The epilogue copies the tile's LSE into registers at its first block and hands the slot
+                    # back to the load warp right there; a tile with no key block releases it here.
+                    head = head_consumer.wait_and_advance()
+                    sLSE_cur = cute.make_tensor(
+                        cute.make_ptr(Float32, (sPerHead.iterator + head.index * self.m_block_size).llvm_ptr, cute.AddressSpace.smem, assumed_align=16),
+                        cute.make_layout((self.m_block_size,)),
+                    )
+                    if num_n_blocks_compute == Int32(0):
+                        head.release()
                     mDenom_cur = seqlen.offset_batch_Q(mDenom, batch_idx, dim=1)
                     mOut_cur = seqlen.offset_batch_Q(mOut, batch_idx, dim=2)
                     s_full_phase_bits, reduce_phase = self._epilogue_attention_dense(
                         tiled_mma_qk,
                         tStS_ref,
-                        sPerHead,
+                        sLSE_cur,
+                        head,
                         sScoreAll,
                         S_mbar_ptr,
                         reduce_sync_mbar_ptr,
@@ -746,9 +772,7 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
                         s_full_phase_bits,
                         reduce_phase,
                         softmax_scale,
-                        per_head_offset=per_head_offset,
                     )
-                    tile_count = tile_count + 1
                 clc_pipeline.consumer_wait(clc_consumer_state)
                 work_tile = tile_sched.get_current_work()
                 clc_pipeline.consumer_release(clc_consumer_state)
@@ -777,17 +801,18 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         warp_id_in_wg,
         warp_sum,
     ):
-        """Cross-warp sum sync with pre-computed warp-level sum."""
+        """Cross-warp sum sync with pre-computed warp-level sum (scratch half selected by the reduce phase)."""
+        red = reduce_sync_phase * Int32(self.sScoreAll_phase_size)
         with cute.arch.elect_one():
-            sScoreAll[warp_id_in_wg] = warp_sum
+            sScoreAll[red + warp_id_in_wg] = warp_sum
         cute.arch.fence_view_async_shared()
         cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
         cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_sync_phase)
         reduce_sync_phase = reduce_sync_phase ^ 1
 
-        global_sum = sScoreAll[0]
+        global_sum = sScoreAll[red]
         for wi in cutlass.range_constexpr(self.num_warps_in_epi_wg - 1):
-            global_sum = global_sum + sScoreAll[wi + 1]
+            global_sum = global_sum + sScoreAll[red + wi + 1]
 
         return global_sum, reduce_sync_phase
 
@@ -799,7 +824,8 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         self,
         tiled_mma_qk,
         tStS_ref,
-        sLSE,
+        sLSE_1d,
+        lse_handle,
         sScoreAll,
         S_mbar_ptr,
         reduce_sync_mbar_ptr,
@@ -815,9 +841,9 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         s_full_phase_bits,
         reduce_phase,
         softmax_scale,
-        per_head_offset=None,
     ):
-        """Dense attention epilogue: TMEM->RF, exp2(S*scale - LSE), head reduce.
+        """Dense attention epilogue: TMEM->RF, exp2(S*scale - LSE), head reduce.  ``sLSE_1d`` is the tile's
+        ``-lse * log2(e)`` SMEM slot: copied to registers at the first block, then handed back (``lse_handle``).
 
         Writes score per n_block to GMEM, accumulates L1-norm denom.
         Supports q_tokens_per_tile = 1 or 2: each q_token's heads occupy
@@ -826,22 +852,11 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         """
         tidx_wg = tidx % self.WARPGROUP_SIZE
 
-        sLSE_off = Int32(0) if per_head_offset is None else per_head_offset
         qhpkv = self.qhead_per_kvhead
         q_tokens_per_tile = self.q_tokens_per_tile
         ratio = Int32(self.ratio)
 
         LSE_ILP = 4
-        sLSE_f32_ptr = cute.make_ptr(
-            Float32,
-            (sLSE.iterator + sLSE_off).llvm_ptr,
-            cute.AddressSpace.smem,
-            assumed_align=16,
-        )
-        sLSE_1d = cute.make_tensor(
-            sLSE_f32_ptr,
-            cute.make_layout((self.m_block_size,)),
-        )
         rLSE_all = cute.make_rmem_tensor((self.m_block_size,), Float32)
 
         kv_offset = Int32(0)
@@ -880,6 +895,7 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
 
             if first_block == Int32(1):
                 cute.autovec_copy(sLSE_1d, rLSE_all)
+                lse_handle.release()
                 first_block = Int32(0)
 
             tmem_ptr_cur = cute.make_ptr(
@@ -977,19 +993,20 @@ class DenseScoreRecomputeSm100(ScoreKernelSm100):
         if cutlass.const_expr(q_tokens_per_tile == 2):
             warp_sum0 = cute.arch.warp_reduction_sum(local_sum_acc[0])
             warp_sum1 = cute.arch.warp_reduction_sum(local_sum_acc[1])
+            red = reduce_phase * Int32(self.sScoreAll_phase_size)
             with cute.arch.elect_one():
-                sScoreAll[warp_id_in_wg] = warp_sum0
-                sScoreAll[warp_id_in_wg + self.num_warps_in_epi_wg] = warp_sum1
+                sScoreAll[red + warp_id_in_wg] = warp_sum0
+                sScoreAll[red + warp_id_in_wg + self.num_warps_in_epi_wg] = warp_sum1
             cute.arch.fence_view_async_shared()
             cute.arch.mbarrier_arrive(reduce_sync_mbar_ptr)
             cute.arch.mbarrier_wait(reduce_sync_mbar_ptr, reduce_phase)
             reduce_phase = reduce_phase ^ 1
 
-            global_sum0 = sScoreAll[0]
-            global_sum1 = sScoreAll[self.num_warps_in_epi_wg]
+            global_sum0 = sScoreAll[red]
+            global_sum1 = sScoreAll[red + self.num_warps_in_epi_wg]
             for wi in cutlass.range_constexpr(self.num_warps_in_epi_wg - 1):
-                global_sum0 = global_sum0 + sScoreAll[wi + 1]
-                global_sum1 = global_sum1 + sScoreAll[self.num_warps_in_epi_wg + wi + 1]
+                global_sum0 = global_sum0 + sScoreAll[red + wi + 1]
+                global_sum1 = global_sum1 + sScoreAll[red + self.num_warps_in_epi_wg + wi + 1]
 
             if q_token_base < seqlen_q:
                 with cute.arch.elect_one():
